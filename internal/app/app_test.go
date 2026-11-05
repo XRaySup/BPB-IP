@@ -121,6 +121,12 @@ func TestLoadConfigDefaultsMissingScanInterval(t *testing.T) {
 	if config.ScanInterval != "30m" {
 		t.Fatalf("missing scanInterval default = %q, want 30m", config.ScanInterval)
 	}
+	if !config.EnableArchive {
+		t.Fatal("missing enableArchive default = false, want true")
+	}
+	if config.IncludeArchive {
+		t.Fatal("missing includeArchive default = true, want false")
+	}
 }
 
 func TestScanIntervalValidation(t *testing.T) {
@@ -130,6 +136,20 @@ func TestScanIntervalValidation(t *testing.T) {
 		if err := config.Validate(); err == nil {
 			t.Errorf("Validate() accepted scanInterval %q", interval)
 		}
+	}
+}
+
+func TestCloudflareMaxRecordsValidation(t *testing.T) {
+	config := testConfig()
+	config.Cloudflare.MaxRecords = -1
+	if err := config.Validate(); err == nil ||
+		!strings.Contains(err.Error(), `config "cloudflare.maxRecords"`) {
+		t.Fatalf("Validate() error = %v, want invalid maxRecords error", err)
+	}
+
+	config.Cloudflare.MaxRecords = 0
+	if err := config.Validate(); err != nil {
+		t.Fatalf("Validate() rejected maxRecords=0: %v", err)
 	}
 }
 
@@ -165,6 +185,57 @@ func TestValidateSourcesAcceptsListWithPort443Endpoint(t *testing.T) {
 	}
 	if err := ValidateSources(testConfig(), listPath); err != nil {
 		t.Fatalf("ValidateSources() error = %v", err)
+	}
+}
+
+func TestValidateSourcesAcceptsArchiveWhenIncluded(t *testing.T) {
+	listPath := filepath.Join(t.TempDir(), "list.txt")
+	archivePath := archiveFilePath(listPath)
+	if err := os.WriteFile(archivePath, []byte("192.0.2.9\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := testConfig()
+	config.IncludeArchive = true
+	if err := ValidateSources(config, listPath); err != nil {
+		t.Fatalf("ValidateSources() with included archive = %v", err)
+	}
+	config.IncludeArchive = false
+	if err := ValidateSources(config, listPath); err == nil {
+		t.Fatal("ValidateSources() accepted archive when includeArchive is false")
+	}
+}
+
+func TestArchiveDeletedIPsRetainsAndDeduplicatesEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "archive.txt")
+	if err := os.WriteFile(path, []byte("192.0.2.1\n2001:db8::1\n192.0.2.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deleted := []Endpoint{
+		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
+		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
+		{IP: netip.MustParseAddr("2001:db8::2"), Port: 443},
+	}
+	if err := archiveDeletedIPs(true, path, deleted); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "192.0.2.1\n2001:db8::1\n192.0.2.2\n2001:db8::2\n"
+	if string(contents) != want {
+		t.Fatalf("archive contents = %q, want %q", contents, want)
+	}
+}
+
+func TestArchiveDeletedIPsCanBeDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "archive.txt")
+	deleted := []Endpoint{{IP: netip.MustParseAddr("192.0.2.2"), Port: 443}}
+	if err := archiveDeletedIPs(false, path, deleted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("archive file stat error = %v, want file not to exist", err)
 	}
 }
 
@@ -213,6 +284,7 @@ func TestCollectEndpointsAggregatesBestEffortSourcesAndFilters443(t *testing.T) 
 		default:
 			http.NotFound(w, r)
 		}
+
 	}))
 	defer server.Close()
 
@@ -275,6 +347,29 @@ func TestCollectEndpointsAggregatesBestEffortSourcesAndFilters443(t *testing.T) 
 	}
 	if !logger.contains("sourceDomains: empty domain entry") {
 		t.Error("expected blank domain to be logged")
+	}
+}
+
+func TestCollectEndpointsIncludesArchiveWhenEnabled(t *testing.T) {
+	config := testConfig()
+	config.IncludeArchive = true
+	logger := &testLogger{}
+	endpoints := CollectEndpointsWithArchive(
+		context.Background(),
+		"192.0.2.1\n",
+		"192.0.2.2\n192.0.2.1\n192.0.2.3:8443\n",
+		config,
+		logger,
+	)
+	want := []Endpoint{
+		{IP: netip.MustParseAddr("192.0.2.1"), Port: 443},
+		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
+	}
+	if !reflect.DeepEqual(endpoints, want) {
+		t.Fatalf("CollectEndpointsWithArchive() = %#v, want %#v", endpoints, want)
+	}
+	if logger.contains("archive.txt: no port 443 endpoints found") {
+		t.Fatalf("archive source was not recognized: %#v", logger.logs)
 	}
 }
 
@@ -383,37 +478,63 @@ func TestOrderProbeResultsBySpeedAndStatus(t *testing.T) {
 	}
 }
 
-func TestLimitCloudflareEndpointsKeepsFastest200(t *testing.T) {
-	endpoints := make([]Endpoint, maxCloudflareRecords+1)
+func TestLimitCloudflareEndpointsKeepsFastestWithinQuota(t *testing.T) {
+	endpoints := make([]Endpoint, 300)
 	for index := range endpoints {
 		endpoints[index] = Endpoint{
 			IP:   netip.AddrFrom4([4]byte{192, 0, byte(index / 256), byte(index%256 + 1)}),
 			Port: 443,
 		}
 	}
-	selected := limitCloudflareEndpoints(endpoints, maxCloudflareRecords)
-	if len(selected) != maxCloudflareRecords {
-		t.Fatalf("selected %d endpoints, want %d", len(selected), maxCloudflareRecords)
+	selected := limitCloudflareEndpoints(endpoints, availableCloudflareRecordSlots(250, 25))
+	if len(selected) != 225 {
+		t.Fatalf("selected %d endpoints, want 225", len(selected))
 	}
-	if selected[maxCloudflareRecords-1] != endpoints[maxCloudflareRecords-1] {
-		t.Fatal("selected endpoints do not preserve the fastest-first order")
+	if selected[224] != endpoints[224] {
+		t.Fatal("selected endpoints do not preserve fastest-first order")
 	}
 }
 
 func TestAvailableCloudflareRecordSlots(t *testing.T) {
 	tests := []struct {
+		recordQuota  int
 		otherRecords int
 		want         int
 	}{
-		{otherRecords: 2, want: 198},
-		{otherRecords: 199, want: 1},
-		{otherRecords: 200, want: 0},
-		{otherRecords: 205, want: 0},
+		{recordQuota: 200, otherRecords: 2, want: 198},
+		{recordQuota: 500, otherRecords: 2, want: 498},
+		{recordQuota: 200, otherRecords: 199, want: 1},
+		{recordQuota: 200, otherRecords: 200, want: 0},
+		{recordQuota: 200, otherRecords: 205, want: 0},
 	}
 	for _, test := range tests {
-		if got := availableCloudflareRecordSlots(test.otherRecords); got != test.want {
-			t.Errorf("availableCloudflareRecordSlots(%d) = %d, want %d", test.otherRecords, got, test.want)
+		if got := availableCloudflareRecordSlots(test.recordQuota, test.otherRecords); got != test.want {
+			t.Errorf("availableCloudflareRecordSlots(%d, %d) = %d, want %d",
+				test.recordQuota, test.otherRecords, got, test.want)
 		}
+	}
+}
+
+func TestCloudflareRecordLimit(t *testing.T) {
+	tests := []struct {
+		name                 string
+		configuredMaxRecords int
+		availableSlots       int
+		want                 int
+	}{
+		{name: "no configured cap", configuredMaxRecords: 0, availableSlots: 300, want: 300},
+		{name: "configured cap below quota", configuredMaxRecords: 50, availableSlots: 300, want: 50},
+		{name: "configured cap above quota", configuredMaxRecords: 300, availableSlots: 198, want: 198},
+		{name: "configured cap equals quota", configuredMaxRecords: 100, availableSlots: 100, want: 100},
+		{name: "no available slots", configuredMaxRecords: 50, availableSlots: 0, want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cloudflareRecordLimit(test.configuredMaxRecords, test.availableSlots); got != test.want {
+				t.Errorf("cloudflareRecordLimit(%d, %d) = %d, want %d",
+					test.configuredMaxRecords, test.availableSlots, got, test.want)
+			}
+		})
 	}
 }
 
@@ -425,7 +546,7 @@ func TestLimitCloudflareEndpointsUsesAvailableSlots(t *testing.T) {
 			Port: 443,
 		}
 	}
-	selected := limitCloudflareEndpoints(endpoints, availableCloudflareRecordSlots(2))
+	selected := limitCloudflareEndpoints(endpoints, availableCloudflareRecordSlots(200, 2))
 	if len(selected) != 198 {
 		t.Fatalf("selected %d endpoints, want 198", len(selected))
 	}
@@ -443,7 +564,7 @@ func containsEndpoint(endpoints []Endpoint, target Endpoint) bool {
 	return false
 }
 
-func TestCountRecordsExcludingHostname(t *testing.T) {
+func TestCountUnmanagedRecords(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/zones/zone-id/dns_records" {
 			http.Error(w, "unexpected request", http.StatusNotFound)
@@ -459,12 +580,14 @@ func TestCountRecordsExcludingHostname(t *testing.T) {
 			_, _ = io.WriteString(w, `{"success":true,"result_info":{"total_pages":2},"result":[
 				{"id":"a","type":"A","name":"text.example.com","content":"192.0.2.1"},
 				{"id":"b","type":"MX","name":"example.com","content":"mail.example.com"},
-				{"id":"c","type":"TXT","name":"x.example.com","content":"v=spf1"}
+				{"id":"c","type":"TXT","name":"x.example.com","content":"v=spf1"},
+				{"id":"f","type":"TXT","name":"text.example.com","content":"v=other"}
 			]}`)
 		case "2":
 			_, _ = io.WriteString(w, `{"success":true,"result_info":{"total_pages":2},"result":[
 				{"id":"d","type":"AAAA","name":"TEXT.EXAMPLE.COM.","content":"2001:db8::1"},
-				{"id":"e","type":"CNAME","name":"www.example.com","content":"example.com"}
+				{"id":"e","type":"CNAME","name":"www.example.com","content":"example.com"},
+				{"id":"g","type":"CNAME","name":"text.example.com","content":"elsewhere.example.com"}
 			]}`)
 		default:
 			http.Error(w, "unexpected page", http.StatusBadRequest)
@@ -478,12 +601,54 @@ func TestCountRecordsExcludingHostname(t *testing.T) {
 		BaseURL: server.URL,
 		Client:  server.Client(),
 	}
-	count, err := client.CountRecordsExcludingHostname(context.Background(), "text.example.com")
+	count, err := client.CountUnmanagedRecords(context.Background(), "text.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 {
-		t.Fatalf("CountRecordsExcludingHostname() = %d, want 3", count)
+	if count != 5 {
+		t.Fatalf("CountUnmanagedRecords() = %d, want 5", count)
+	}
+}
+
+func TestGetRecordQuota(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/zones/zone-id/dns_records/usage" {
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("unexpected authorization header %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true,"result":{"record_quota":500,"record_usage":230}}`)
+	}))
+	defer server.Close()
+
+	client := CloudflareClient{
+		ZoneID: "zone-id", Token: "test-token", BaseURL: server.URL, Client: server.Client(),
+	}
+	quota, err := client.GetRecordQuota(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quota != 500 {
+		t.Fatalf("GetRecordQuota() = %d, want 500", quota)
+	}
+}
+
+func TestGetRecordQuotaRejectsAccountLevelQuota(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true,"result":{"record_quota":null,"record_usage":230}}`)
+	}))
+	defer server.Close()
+
+	client := CloudflareClient{
+		ZoneID: "zone-id", Token: "test-token", BaseURL: server.URL, Client: server.Client(),
+	}
+	if _, err := client.GetRecordQuota(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "record_quota is null") {
+		t.Fatalf("GetRecordQuota() error = %v, want unavailable quota error", err)
 	}
 }
 
@@ -713,6 +878,50 @@ func TestReconcileDNSPostsWhenHostnameHasNoRecords(t *testing.T) {
 	}
 }
 
+func TestReconcileDNSPostsInBatchesOf200(t *testing.T) {
+	var batches []int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/zone-id/dns_records":
+			_, _ = io.WriteString(w, `{"success":true,"result_info":{"total_pages":1},"result":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/zones/zone-id/dns_records/batch":
+			var batch dnsBatchPayload
+			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+				t.Error(err)
+				http.Error(w, "invalid batch", http.StatusBadRequest)
+				return
+			}
+			size := len(batch.Patches) + len(batch.Deletes) + len(batch.Posts)
+			if size == 0 || size > cloudflareMaxBatchOperations {
+				t.Errorf("batch has %d operations", size)
+			}
+			batches = append(batches, size)
+			_, _ = io.WriteString(w, `{"success":true,"result":{"posts":[]}}`)
+		default:
+			http.Error(w, "unexpected request", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	endpoints := make([]Endpoint, 300)
+	for index := range endpoints {
+		endpoints[index] = Endpoint{
+			IP:   netip.MustParseAddr(fmt.Sprintf("2001:db8::%x", index+1)),
+			Port: 443,
+		}
+	}
+	client := CloudflareClient{
+		ZoneID: "zone-id", Token: "test-token", BaseURL: server.URL, Client: server.Client(),
+	}
+	if err := client.ReconcileDNS(context.Background(), "proxy.example.com", endpoints); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(batches, []int{200, 100}) {
+		t.Fatalf("post batch sizes = %v, want [200 100]", batches)
+	}
+}
+
 func TestReconcileDNSDeletesRecordsBeyondDesiredSet(t *testing.T) {
 	records := []dnsRecord{
 		{ID: "keep", Type: "A", Name: "proxy.example.com", Content: "192.0.2.1"},
@@ -805,8 +1014,8 @@ func TestReconcileDNSWithEmptySelectionDeletesManagedRecords(t *testing.T) {
 }
 
 func TestBuildDNSChangeBatchesKeepsEachBatchWithinCloudflareLimit(t *testing.T) {
-	patches := make([]dnsRecordPatch, cloudflareMaxBatchOperations+1)
-	deletes := make([]dnsRecordDelete, cloudflareMaxBatchOperations+1)
+	patches := make([]dnsRecordPatch, 300)
+	deletes := make([]dnsRecordDelete, 300)
 	for i := range patches {
 		patches[i].ID = fmt.Sprintf("patch-%03d", i)
 		deletes[i].ID = fmt.Sprintf("delete-%03d", i)
@@ -816,11 +1025,15 @@ func TestBuildDNSChangeBatchesKeepsEachBatchWithinCloudflareLimit(t *testing.T) 
 	if len(batches) != 3 {
 		t.Fatalf("batch count = %d, want 3", len(batches))
 	}
+	wantOperations := []int{200, 200, 200}
 	patchCount, deleteCount := 0, 0
 	for index, batch := range batches {
 		operationCount := len(batch.Patches) + len(batch.Deletes)
 		if operationCount == 0 || operationCount > cloudflareMaxBatchOperations {
 			t.Errorf("batch %d has %d operations", index, operationCount)
+		}
+		if operationCount != wantOperations[index] {
+			t.Errorf("batch %d has %d operations, want %d", index, operationCount, wantOperations[index])
 		}
 		patchCount += len(batch.Patches)
 		deleteCount += len(batch.Deletes)
@@ -974,7 +1187,7 @@ func TestWriteScanResults(t *testing.T) {
 		{IP: netip.MustParseAddr("192.0.2.2"), Port: 443},
 	}
 	scannedAt := time.Date(2026, 11, 1, 0, 13, 56, 0, time.UTC)
-	path, err := writeScanResults(resultsDir, results, deleted, scannedAt)
+	path, err := writeScanResults(resultsDir, results, deleted, probeStatusDeleted, scannedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -996,6 +1209,31 @@ func TestWriteScanResults(t *testing.T) {
 		{"192.0.2.1", "passed", "12939.43", ""},
 		{"2001:db8::1", "failed", "", "probe timed out"},
 		{"192.0.2.2", "deleted", "", ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("scan report rows = %#v, want %#v", got, want)
+	}
+}
+
+func TestWriteScanResultsUsesArchivedStatus(t *testing.T) {
+	resultsDir := t.TempDir()
+	deleted := []Endpoint{{IP: netip.MustParseAddr("192.0.2.2"), Port: 443}}
+	path, err := writeScanResults(resultsDir, nil, deleted, probeStatusArchived, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got, err := csv.NewReader(file).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"IP", "Status", "Speed (KB/s)", "Error"},
+		{"192.0.2.2", "archived", "", ""},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("scan report rows = %#v, want %#v", got, want)

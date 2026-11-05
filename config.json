@@ -8,9 +8,12 @@
   "trials": 3,
   "sourceUrls": [],
   "sourceDomains": [],
+  "enableArchive": true,
+  "includeArchive": false,
   "cloudflare": {
     "zoneId": "",
     "recordName": "",
-    "apiToken": ""
+    "apiToken": "",
+    "maxRecords": 0
   }
 }
